@@ -28,7 +28,9 @@ import {
     HardDrive,
     Activity,
     Shield,
-    Zap
+    Zap,
+    Box,
+    Container
 } from 'lucide-react';
 
 const API_BASE = '/api/v1/verification';
@@ -44,14 +46,28 @@ function BinaryVerification() {
     const [results, setResults] = useState(null);
     const [error, setError] = useState(null);
     const [firmwareInfo, setFirmwareInfo] = useState(null);
+    const [dockerStatus, setDockerStatus] = useState({ docker_available: false, mode: 'checking' });
 
     const logsEndRef = useRef(null);
     const logPollRef = useRef(null);
+    const logOffsetRef = useRef(0);  // Track log offset to prevent duplicates
+    const isFetchingRef = useRef(false);  // Prevent concurrent fetches
 
-    // Load available emulators on mount
+    // Load available emulators and Docker status on mount
     useEffect(() => {
         fetchEmulators();
+        fetchDockerStatus();
     }, []);
+
+    const fetchDockerStatus = async () => {
+        try {
+            const res = await fetch(`${API_BASE}/docker-status`);
+            const data = await res.json();
+            setDockerStatus(data);
+        } catch (err) {
+            setDockerStatus({ docker_available: false, mode: 'simulated', message: 'Failed to check Docker' });
+        }
+    };
 
     // Auto-scroll logs
     useEffect(() => {
@@ -65,7 +81,7 @@ function BinaryVerification() {
         if (status === 'running' && sessionId) {
             logPollRef.current = setInterval(() => {
                 fetchLogs();
-            }, 500);
+            }, 1000);  // Increased to 1 second to reduce race conditions
         }
         return () => {
             if (logPollRef.current) {
@@ -85,11 +101,15 @@ function BinaryVerification() {
     };
 
     const fetchLogs = async () => {
-        if (!sessionId) return;
+        if (!sessionId || isFetchingRef.current) return;
+        isFetchingRef.current = true;
+
         try {
-            const res = await fetch(`${API_BASE}/logs/${sessionId}?offset=${logs.length}`);
+            const res = await fetch(`${API_BASE}/logs/${sessionId}?offset=${logOffsetRef.current}`);
             const data = await res.json();
             if (data.logs && data.logs.length > 0) {
+                // Update offset BEFORE updating state to prevent race conditions
+                logOffsetRef.current += data.logs.length;
                 setLogs(prev => [...prev, ...data.logs]);
             }
             if (data.status === 'completed' || data.status === 'failed') {
@@ -103,6 +123,8 @@ function BinaryVerification() {
             }
         } catch (err) {
             console.error('Failed to fetch logs:', err);
+        } finally {
+            isFetchingRef.current = false;
         }
     };
 
@@ -137,6 +159,7 @@ function BinaryVerification() {
         setError(null);
         setLogs([]);
         setResults(null);
+        logOffsetRef.current = 0;  // Reset log offset for new session
 
         try {
             const formData = new FormData();
@@ -167,7 +190,9 @@ function BinaryVerification() {
         if (!sessionId) return;
 
         setStatus('running');
-        setLogs(prev => [...prev, { message: 'Starting verification...', timestamp: new Date().toISOString() }]);
+        // Reset log offset to 0 - backend clears logs when run starts
+        logOffsetRef.current = 0;
+        setLogs([{ message: 'Starting verification...', timestamp: new Date().toISOString() }]);
 
         try {
             const res = await fetch(`${API_BASE}/run/${sessionId}`, {
@@ -197,6 +222,8 @@ function BinaryVerification() {
         setResults(null);
         setError(null);
         setFirmwareInfo(null);
+        logOffsetRef.current = 0;  // Reset log offset
+        isFetchingRef.current = false;  // Reset fetching flag
     };
 
     const getVerdictColor = (verdict) => {
@@ -220,12 +247,31 @@ function BinaryVerification() {
     return (
         <div className="space-y-6">
             {/* Header */}
-            <div>
-                <h1 className="text-2xl font-bold text-gray-100 flex items-center">
-                    <Shield className="w-7 h-7 mr-3 text-purple-500" />
-                    Binary Verification
-                </h1>
-                <p className="text-gray-400 mt-1">Upload firmware binary and run verification tests against emulator</p>
+            <div className="flex items-start justify-between">
+                <div>
+                    <h1 className="text-2xl font-bold text-gray-100 flex items-center">
+                        <Shield className="w-7 h-7 mr-3 text-purple-500" />
+                        Binary Verification
+                    </h1>
+                    <p className="text-gray-400 mt-1">Upload firmware binary and run verification tests in Docker emulator</p>
+                </div>
+                <div className={`px-4 py-2 rounded-lg border ${
+                    dockerStatus.docker_available
+                        ? 'bg-green-500/20 border-green-500/30 text-green-400'
+                        : 'bg-yellow-500/20 border-yellow-500/30 text-yellow-400'
+                }`}>
+                    <div className="flex items-center text-sm">
+                        <Box className="w-4 h-4 mr-2" />
+                        <span className="font-medium">
+                            {dockerStatus.docker_available ? 'Docker Mode' : 'Simulation Mode'}
+                        </span>
+                    </div>
+                    <p className="text-xs mt-1 opacity-75">
+                        {dockerStatus.docker_available
+                            ? `v${dockerStatus.docker_version}`
+                            : 'Docker not available'}
+                    </p>
+                </div>
             </div>
 
             {/* Configuration Panel */}
@@ -425,10 +471,27 @@ function BinaryVerification() {
                 <div className="space-y-6">
                     {/* Summary */}
                     <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
-                        <h3 className="text-lg font-medium text-gray-200 mb-4 flex items-center">
-                            <BarChart3 className="w-5 h-5 mr-2 text-blue-400" />
-                            Verification Results
-                        </h3>
+                        <div className="flex items-center justify-between mb-4">
+                            <h3 className="text-lg font-medium text-gray-200 flex items-center">
+                                <BarChart3 className="w-5 h-5 mr-2 text-blue-400" />
+                                Verification Results
+                            </h3>
+                            {results.docker_mode && (
+                                <div className={`px-3 py-1 rounded-lg text-xs font-medium flex items-center ${
+                                    results.docker_mode === 'real'
+                                        ? 'bg-green-500/20 text-green-400'
+                                        : 'bg-yellow-500/20 text-yellow-400'
+                                }`}>
+                                    <Box className="w-3 h-3 mr-1" />
+                                    {results.docker_mode === 'real' ? 'Docker' : 'Simulated'}
+                                    {results.container_id && (
+                                        <span className="ml-2 font-mono opacity-75">
+                                            {results.container_id.substring(0, 12)}
+                                        </span>
+                                    )}
+                                </div>
+                            )}
+                        </div>
 
                         <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
                             {/* Verdict */}

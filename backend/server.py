@@ -54,6 +54,11 @@ from chipset_emulation import (
     chipset_orchestrator
 )
 
+from docker_emulator import (
+    DockerEmulationOrchestrator,
+    docker_orchestrator
+)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("phoenix2.server")
 
@@ -282,6 +287,17 @@ verification_router = APIRouter(prefix="/api/v1/verification", tags=["Binary Ver
 # In-memory storage for verification sessions
 verification_sessions: Dict[str, Dict[str, Any]] = {}
 
+@verification_router.get("/docker-status")
+async def get_docker_status():
+    """Check Docker availability for emulation."""
+    status = await docker_orchestrator.docker_manager.check_docker_available()
+    return {
+        "docker_available": status.get("available", False),
+        "docker_version": status.get("version"),
+        "message": status.get("message"),
+        "mode": "real" if status.get("available") else "simulated"
+    }
+
 @verification_router.get("/emulators")
 async def list_available_emulators():
     """List all emulators available for binary verification."""
@@ -327,8 +343,8 @@ async def upload_binary_for_verification(
         raise HTTPException(status_code=400, detail=str(e))
 
 @verification_router.post("/run/{session_id}")
-async def run_verification(session_id: str):
-    """Run verification tests for a previously uploaded binary."""
+async def run_verification(session_id: str, use_docker: bool = Query(True, description="Use Docker-based emulation")):
+    """Run verification tests for a previously uploaded binary using Docker emulation."""
     if session_id not in verification_sessions:
         raise HTTPException(status_code=404, detail=f"Verification session {session_id} not found")
 
@@ -345,6 +361,7 @@ async def run_verification(session_id: str):
         emulator_id = session["emulator_id"]
         tests = platform_orchestrator.registry_manager.get_tests(emulator_id)
 
+        # Generate tests if not available
         if not tests:
             from emulation_platform import EmulatorConfig, EmulatorStatus, ParsedCapability, ParsedRequirement, TestSeverity
             emulator = session["emulator_info"]
@@ -375,13 +392,32 @@ async def run_verification(session_id: str):
         def log_callback(log_entry):
             session["logs"].append(log_entry)
 
-        test_results = await platform_orchestrator.test_executor.execute_tests(
+        # Use Docker-based emulation
+        docker_result = await docker_orchestrator.run_verification(
             emulator_config=session["emulator_info"],
             tests=tests,
             firmware_path=session["firmware_info"]["path"],
             log_callback=log_callback
         )
 
+        # Convert Docker results to standard TestResult format for report generation
+        from emulation_platform import TestResult
+        test_results = []
+        for tr in docker_result.get("test_results", []):
+            test_results.append(TestResult(
+                test_id=tr["test_id"],
+                test_name=tr["test_name"],
+                category="boot" if "boot" in tr["test_name"].lower() else "feature",
+                status=tr["status"],
+                duration_sec=tr["duration_sec"],
+                actual_result=tr["output"][:200] if tr.get("output") else "Completed",
+                expected_result="Pass",
+                evidence=tr.get("evidence", {}),
+                logs=[tr.get("output", "")],
+                timestamp=datetime.now().isoformat()
+            ))
+
+        # Generate comprehensive report
         report = await platform_orchestrator.report_generator.generate_report(
             emulator_config=session["emulator_info"],
             test_results=test_results,
@@ -394,6 +430,8 @@ async def run_verification(session_id: str):
             "report_id": report.report_id,
             "verdict": report.verdict,
             "summary": report.summary,
+            "docker_mode": docker_result.get("docker_mode", "simulated"),
+            "container_id": docker_result.get("container_id"),
             "test_results": [asdict(r) if hasattr(r, '__dataclass_fields__') else r for r in test_results],
             "boot_analysis": report.boot_analysis,
             "feature_coverage": report.feature_coverage,
@@ -407,7 +445,8 @@ async def run_verification(session_id: str):
             "session_id": session_id,
             "report_id": report.report_id,
             "verdict": report.verdict,
-            "summary": report.summary
+            "summary": report.summary,
+            "docker_mode": docker_result.get("docker_mode", "simulated")
         }
 
     except Exception as e:
