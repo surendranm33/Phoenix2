@@ -14,15 +14,18 @@ import {
     Flame,
     ChevronDown,
     Box,
-    Activity
+    Activity,
+    Shield
 } from 'lucide-react';
 
 import EmulationPlatform from './components/EmulationPlatform';
+import BinaryVerification from './components/BinaryVerification';
 
 // Navigation Items
 const navItems = [
     { path: '/', label: 'Dashboard', icon: LayoutDashboard, description: 'Overview' },
     { path: '/emulation-platform', label: 'Emulation Platform', icon: Factory, description: 'End-to-end workflow' },
+    { path: '/binary-verification', label: 'Binary Verification', icon: Shield, description: 'Test firmware' },
     { path: '/chipset-profiles', label: 'Chipset Profiles', icon: Cpu, description: 'Vendor chipsets' },
 ];
 
@@ -253,6 +256,7 @@ function AppRoutes() {
         <Routes>
             <Route path="/" element={<MainLayout><Dashboard /></MainLayout>} />
             <Route path="/emulation-platform" element={<MainLayout><EmulationPlatform /></MainLayout>} />
+            <Route path="/binary-verification" element={<MainLayout><BinaryVerification /></MainLayout>} />
             <Route path="/chipset-profiles" element={<MainLayout><ChipsetProfiles /></MainLayout>} />
             <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

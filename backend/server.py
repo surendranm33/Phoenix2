@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -276,8 +277,223 @@ async def root():
 async def health_check():
     return {"status": "healthy", "service": "phoenix2", "timestamp": datetime.now().isoformat()}
 
+verification_router = APIRouter(prefix="/api/v1/verification", tags=["Binary Verification"])
+
+# In-memory storage for verification sessions
+verification_sessions: Dict[str, Dict[str, Any]] = {}
+
+@verification_router.get("/emulators")
+async def list_available_emulators():
+    """List all emulators available for binary verification."""
+    emulators = platform_orchestrator.registry_manager.list_emulators()
+    return {"emulators": emulators, "count": len(emulators)}
+
+@verification_router.post("/upload-binary")
+async def upload_binary_for_verification(
+    emulator_id: str = Query(..., description="Emulator ID to associate binary with"),
+    binary_file: UploadFile = File(..., description="Binary firmware file to verify")
+):
+    """Upload a binary file and associate it with an emulator for verification."""
+    try:
+        emulator = platform_orchestrator.registry_manager.get_emulator(emulator_id)
+        if not emulator:
+            raise HTTPException(status_code=404, detail=f"Emulator {emulator_id} not found")
+
+        binary_data = await binary_file.read()
+        firmware_info = await platform_orchestrator.test_executor.upload_binary(binary_data, binary_file.filename)
+
+        session_id = f"VER_{uuid.uuid4().hex[:8].upper()}"
+        verification_sessions[session_id] = {
+            "session_id": session_id,
+            "emulator_id": emulator_id,
+            "emulator_info": emulator,
+            "firmware_info": firmware_info,
+            "status": "uploaded",
+            "logs": [],
+            "results": None,
+            "created_at": datetime.now().isoformat()
+        }
+
+        return {
+            "status": "uploaded",
+            "session_id": session_id,
+            "emulator_id": emulator_id,
+            "firmware_info": firmware_info
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Binary upload error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@verification_router.post("/run/{session_id}")
+async def run_verification(session_id: str):
+    """Run verification tests for a previously uploaded binary."""
+    if session_id not in verification_sessions:
+        raise HTTPException(status_code=404, detail=f"Verification session {session_id} not found")
+
+    session = verification_sessions[session_id]
+
+    if session["status"] == "running":
+        raise HTTPException(status_code=400, detail="Verification already running")
+
+    session["status"] = "running"
+    session["started_at"] = datetime.now().isoformat()
+    session["logs"] = []
+
+    try:
+        emulator_id = session["emulator_id"]
+        tests = platform_orchestrator.registry_manager.get_tests(emulator_id)
+
+        if not tests:
+            from emulation_platform import EmulatorConfig, EmulatorStatus, ParsedCapability, ParsedRequirement, TestSeverity
+            emulator = session["emulator_info"]
+            capabilities = [ParsedCapability(**cap) if isinstance(cap, dict) else cap for cap in emulator.get('capabilities', [])]
+            requirements = []
+            for req in emulator.get('requirements', []):
+                if isinstance(req, dict):
+                    req['severity'] = TestSeverity(req.get('severity', 'medium'))
+                    requirements.append(ParsedRequirement(**req))
+
+            config = EmulatorConfig(
+                emulator_id=emulator['emulator_id'], board_name=emulator['board_name'],
+                soc_id=emulator.get('soc_id', 'unknown'), vendor=emulator.get('vendor', 'unknown'),
+                architecture=emulator.get('architecture', 'aarch64'),
+                cpu_type=emulator.get('cpu_type', 'ARM'), cpu_cores=emulator.get('cpu_cores', 4),
+                memory_mb=emulator.get('memory_mb', 1024), flash_mb=emulator.get('flash_mb', 256),
+                capabilities=capabilities, requirements=requirements,
+                created_at=emulator['created_at'], source_documents=emulator.get('source_documents', []),
+                status=EmulatorStatus(emulator.get('status', 'ready'))
+            )
+
+            boot_tests = await platform_orchestrator.boot_test_generator.generate_boot_tests(config)
+            feature_tests = await platform_orchestrator.feature_test_generator.generate_feature_tests(config)
+            all_tests = boot_tests + feature_tests
+            await platform_orchestrator.registry_manager.register_tests(emulator_id, all_tests)
+            tests = platform_orchestrator.registry_manager.get_tests(emulator_id)
+
+        def log_callback(log_entry):
+            session["logs"].append(log_entry)
+
+        test_results = await platform_orchestrator.test_executor.execute_tests(
+            emulator_config=session["emulator_info"],
+            tests=tests,
+            firmware_path=session["firmware_info"]["path"],
+            log_callback=log_callback
+        )
+
+        report = await platform_orchestrator.report_generator.generate_report(
+            emulator_config=session["emulator_info"],
+            test_results=test_results,
+            firmware_info=session["firmware_info"]
+        )
+        await platform_orchestrator.registry_manager.register_report(report)
+
+        from dataclasses import asdict
+        session["results"] = {
+            "report_id": report.report_id,
+            "verdict": report.verdict,
+            "summary": report.summary,
+            "test_results": [asdict(r) if hasattr(r, '__dataclass_fields__') else r for r in test_results],
+            "boot_analysis": report.boot_analysis,
+            "feature_coverage": report.feature_coverage,
+            "recommendations": report.recommendations
+        }
+        session["status"] = "completed"
+        session["completed_at"] = datetime.now().isoformat()
+
+        return {
+            "status": "completed",
+            "session_id": session_id,
+            "report_id": report.report_id,
+            "verdict": report.verdict,
+            "summary": report.summary
+        }
+
+    except Exception as e:
+        session["status"] = "failed"
+        session["error"] = str(e)
+        session["logs"].append({"message": f"ERROR: {str(e)}", "timestamp": datetime.now().isoformat()})
+        logger.error(f"Verification error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@verification_router.get("/status/{session_id}")
+async def get_verification_status(session_id: str):
+    """Get status of a verification session."""
+    if session_id not in verification_sessions:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    session = verification_sessions[session_id]
+    return {
+        "session_id": session_id,
+        "status": session["status"],
+        "emulator_id": session["emulator_id"],
+        "created_at": session["created_at"],
+        "started_at": session.get("started_at"),
+        "completed_at": session.get("completed_at"),
+        "log_count": len(session.get("logs", [])),
+        "has_results": session.get("results") is not None
+    }
+
+@verification_router.get("/logs/{session_id}")
+async def get_verification_logs(
+    session_id: str,
+    offset: int = Query(0, description="Log offset for pagination")
+):
+    """Get logs from a verification session."""
+    if session_id not in verification_sessions:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    session = verification_sessions[session_id]
+    logs = session.get("logs", [])
+
+    return {
+        "session_id": session_id,
+        "status": session["status"],
+        "logs": logs[offset:],
+        "total_logs": len(logs),
+        "offset": offset
+    }
+
+@verification_router.get("/results/{session_id}")
+async def get_verification_results(session_id: str):
+    """Get test results from a completed verification session."""
+    if session_id not in verification_sessions:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    session = verification_sessions[session_id]
+
+    if session["status"] != "completed":
+        return {
+            "session_id": session_id,
+            "status": session["status"],
+            "message": "Verification not yet completed",
+            "results": None
+        }
+
+    return {
+        "session_id": session_id,
+        "status": "completed",
+        "results": session.get("results")
+    }
+
+@verification_router.get("/sessions")
+async def list_verification_sessions():
+    """List all verification sessions."""
+    sessions = []
+    for session_id, session in verification_sessions.items():
+        sessions.append({
+            "session_id": session_id,
+            "emulator_id": session["emulator_id"],
+            "status": session["status"],
+            "created_at": session["created_at"],
+            "verdict": session.get("results", {}).get("verdict") if session.get("results") else None
+        })
+    return {"sessions": sessions, "count": len(sessions)}
+
 app.include_router(platform_router)
 app.include_router(chipset_router)
+app.include_router(verification_router)
 
 def main():
     host = os.environ.get("HOST", "0.0.0.0")
