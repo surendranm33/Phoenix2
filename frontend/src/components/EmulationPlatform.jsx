@@ -708,7 +708,7 @@ export default function EmulationPlatform() {
                                 <input
                                     ref={firmwareInputRef}
                                     type="file"
-                                    accept=".bin,.img,.fw"
+                                    accept=".bin,.img,.fw,.zip,.tar,.gz,.tgz"
                                     onChange={handleFirmwareSelect}
                                     className="hidden"
                                 />
@@ -724,6 +724,7 @@ export default function EmulationPlatform() {
                                     <div className="flex flex-col items-center">
                                         <FolderUp className="w-8 h-8 text-gray-500 mb-2" />
                                         <p className="text-sm text-gray-400">Select firmware binary</p>
+                                        <p className="text-xs text-gray-500 mt-1">Supports: .bin, .img, .fw, .zip, .tar, .gz</p>
                                     </div>
                                 )}
                             </div>
