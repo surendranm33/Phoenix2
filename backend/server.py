@@ -166,7 +166,22 @@ async def run_complete_workflow(
         spec_documents = []
         for file in spec_files:
             content = await file.read()
-            spec_documents.append({"path": file.filename, "content": content.decode('utf-8')})
+            # Try to decode as text, skip binary files with warning
+            try:
+                content_str = content.decode('utf-8')
+                spec_documents.append({"path": file.filename, "content": content_str})
+            except UnicodeDecodeError:
+                # Try latin-1 as fallback for some text files
+                try:
+                    content_str = content.decode('latin-1')
+                    spec_documents.append({"path": file.filename, "content": content_str})
+                except:
+                    logger.warning(f"Skipping binary file: {file.filename}")
+                    continue
+
+        if not spec_documents:
+            raise HTTPException(status_code=400, detail="No valid specification documents provided. Please upload text files (.yaml, .json, .md, .txt)")
+
         firmware_data = await firmware_file.read()
         result = await platform_orchestrator.run_complete_workflow(
             board_name=board_name, spec_documents=spec_documents,
@@ -174,7 +189,10 @@ async def run_complete_workflow(
             custom_emulator_id=emulator_id
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Workflow error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 @platform_router.get("/registry/emulators")
